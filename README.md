@@ -2,6 +2,10 @@
 
 > AI-powered multi-agent negotiation platform — Simulation Mode (AI vs AI) and Practice Mode (Human vs AI).
 
+## Live Demo
+
+[Open Negotiation Arena](https://negotiation-arena-17jj.onrender.com)
+
 ## Features
 
 - **3 Prebuilt Scenarios**: Vendor Pricing, Job Offer, Project Budget
