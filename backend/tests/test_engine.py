@@ -313,3 +313,103 @@ def test_assistant_agent_handles_indian_currency_values_and_ai_vs_ai_mode():
     assert config["candidate_target"] == 1800000
     assert config["recruiter_budget"] == 2200000
     assert config["max_rounds"] == 6
+
+
+def test_agent_scenario_descriptions_do_not_include_private_financial_limits():
+    from app.engine.scenarios import JobOfferRules, ProjectBudgetRules, VendorPricingRules
+
+    scenarios = [
+        (
+            VendorPricingRules({
+                "starting_price": 987654,
+                "buyer_target_price": 876543,
+                "buyer_max_price": 765432,
+                "vendor_min_price": 654321,
+            }),
+            ("876543", "765432", "654321"),
+        ),
+        (
+            JobOfferRules({
+                "starting_salary": 987654,
+                "candidate_target": 876543,
+                "candidate_min": 765432,
+                "recruiter_budget": 654321,
+            }),
+            ("876543", "765432", "654321"),
+        ),
+        (
+            ProjectBudgetRules({
+                "total_budget": 987654,
+                "alpha_requested": 876543,
+                "beta_requested": 765432,
+                "alpha_minimum": 54321,
+                "beta_minimum": 54321,
+            }),
+            ("876543", "765432", "54321"),
+        ),
+    ]
+    for rules, private_values in scenarios:
+        for party in ("agent_a", "agent_b"):
+            description = rules.describe_for_agent(party)
+            assert all(value not in description for value in private_values)
+
+
+@pytest.mark.asyncio
+async def test_project_report_scores_agent_b_offer_from_alpha_perspective():
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import StaticPool
+
+    from app.db.models import (
+        Negotiation,
+        NegotiationMode,
+        NegotiationStatus,
+        ScenarioType,
+        User,
+    )
+    from app.db.session import Base
+    from app.engine.negotiation_engine import NegotiationEngine
+
+    test_engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        poolclass=StaticPool,
+    )
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    session_factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with session_factory() as db:
+        user = User(name="Test", email="project-report@example.com", hashed_password="unused")
+        db.add(user)
+        await db.flush()
+        negotiation = Negotiation(
+            user_id=user.id,
+            title="Project allocation",
+            scenario_type=ScenarioType.PROJECT_BUDGET,
+            mode=NegotiationMode.SIMULATION,
+            status=NegotiationStatus.ACTIVE,
+            config={
+                "total_budget": 5_000_000,
+                "alpha_minimum": 2_000_000,
+                "beta_minimum": 2_000_000,
+                "alpha_requested": 3_000_000,
+                "beta_requested": 3_500_000,
+            },
+            max_rounds=5,
+        )
+        db.add(negotiation)
+        await db.flush()
+        rules = ProjectBudgetRules(negotiation.config)
+        await NegotiationEngine(negotiation.id, db)._complete_negotiation(
+            negotiation,
+            rules,
+            {"my_allocation": 3_000_000, "opponent_allocation": 2_000_000},
+            [],
+            offer_made_by="agent_b",
+        )
+
+        assert negotiation.outcome_data["satisfaction_scores"] == {
+            "team_alpha": 0,
+            "team_beta": 67,
+            "overall": 34,
+        }
+    await test_engine.dispose()

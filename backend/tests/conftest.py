@@ -2,9 +2,9 @@ import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from sqlalchemy.orm import DeclarativeBase
 
 from app.main import app
+from app.core.limits import ai_request_gate, request_limiter, simulation_gate, sse_gate
 from app.db.session import Base, get_db
 from app.core.config import settings
 
@@ -31,7 +31,17 @@ app.dependency_overrides[get_db] = override_get_db
 
 
 @pytest_asyncio.fixture(autouse=True)
-async def setup_db():
+async def setup_db(monkeypatch):
+    request_limiter.reset()
+    ai_request_gate.reset()
+    simulation_gate.reset()
+    sse_gate.reset()
+    monkeypatch.setattr(settings, "USE_MOCK_AGENTS", True)
+    monkeypatch.setattr(settings, "GROQ_API_KEY", None)
+    monkeypatch.setattr("app.main.engine", test_engine)
+    monkeypatch.setattr("app.db.session.AsyncSessionLocal", TestSessionLocal)
+    monkeypatch.setattr("app.engine.negotiation_engine.AsyncSessionLocal", TestSessionLocal)
+    monkeypatch.setattr("app.api.v1.negotiations.AsyncSessionLocal", TestSessionLocal)
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield

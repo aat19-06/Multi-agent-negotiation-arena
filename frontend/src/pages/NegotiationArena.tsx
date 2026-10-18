@@ -140,8 +140,11 @@ export const NegotiationArena: React.FC = () => {
           {isForbiddenNegotiation && (
             <Button
               variant="secondary"
-              onClick={() => {
-                logout();
+              onClick={async () => {
+                const revoked = await logout();
+                if (!revoked) {
+                  toast.error('Signed out locally, but the server could not revoke the session.');
+                }
                 navigate('/login', { replace: true });
               }}
             >

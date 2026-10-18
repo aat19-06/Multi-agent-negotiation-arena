@@ -64,12 +64,31 @@ async def get_current_user(
     if payload.get("type") != "access":
         raise HTTPException(status_code=401, detail="Invalid token type")
 
-    user_id: str = payload.get("sub")
-    if not user_id:
+    user_id = _token_user_id(payload)
+    if user_id is None:
         raise HTTPException(status_code=401, detail="Invalid token payload")
 
-    result = await db.execute(select(User).where(User.id == int(user_id)))
+    result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
-    if not user or not user.is_active:
+    if not user or not user.is_active or not _token_version_matches(payload, user):
         raise HTTPException(status_code=401, detail="User not found or inactive")
     return user
+
+
+def _token_user_id(payload: dict) -> int | None:
+    subject = payload.get("sub")
+    if (
+        not isinstance(subject, str)
+        or len(subject) > 10
+        or not subject.isascii()
+        or not subject.isdecimal()
+        or int(subject) < 1
+        or int(subject) > 2_147_483_647
+    ):
+        return None
+    return int(subject)
+
+
+def _token_version_matches(payload: dict, user) -> bool:
+    version = payload.get("ver", 0)
+    return type(version) is int and version == user.token_version

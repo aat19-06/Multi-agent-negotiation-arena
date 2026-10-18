@@ -39,9 +39,13 @@ export const Sidebar: React.FC = () => {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [editTitle, setEditTitle] = useState('');
 
-  const handleSignOut = () => {
-    logout();
-    toast.success('Signed out successfully');
+  const handleSignOut = async () => {
+    const revoked = await logout();
+    if (revoked) {
+      toast.success('Signed out successfully');
+    } else {
+      toast.error('Signed out locally, but the server could not revoke the session. Existing tokens expire automatically.');
+    }
     navigate('/login');
   };
 
