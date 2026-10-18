@@ -1,3 +1,5 @@
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.pool import StaticPool
@@ -5,11 +7,31 @@ from sqlalchemy.pool import StaticPool
 from app.core.config import settings
 
 
-database_url = settings.DATABASE_URL
-if database_url.startswith("postgres://"):
-    database_url = database_url.replace("postgres://", "postgresql+asyncpg://", 1)
-elif database_url.startswith("postgresql://"):
-    database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+def normalize_database_url(url: str) -> str:
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+    if not url.startswith("postgresql+asyncpg://"):
+        return url
+
+    parsed = urlsplit(url)
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    sslmode = next((value for key, value in query if key.lower() == "sslmode"), None)
+    has_ssl = any(key.lower() == "ssl" for key, _ in query)
+    query = [
+        (key, value)
+        for key, value in query
+        if key.lower() not in {"sslmode", "channel_binding"}
+    ]
+    if sslmode is not None and not has_ssl:
+        query.append(("ssl", sslmode))
+
+    return urlunsplit(parsed._replace(query=urlencode(query)))
+
+
+database_url = normalize_database_url(settings.DATABASE_URL)
 
 if settings.USE_SQLITE_FALLBACK and database_url.startswith(("postgresql", "postgres")):
     database_url = "sqlite+aiosqlite:///./negotiation_arena.db"
