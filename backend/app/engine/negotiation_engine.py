@@ -9,8 +9,10 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.agents.errors import AIProviderError
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
 from app.db.models import (
@@ -25,8 +27,10 @@ logger = logging.getLogger(__name__)
 
 
 def _get_agent(personality: str, role: str):
-    if settings.USE_MOCK_AGENTS or not settings.GROQ_API_KEY:
+    if settings.USE_MOCK_AGENTS:
         return MockAgent(personality=personality, role=role)
+    if not settings.GROQ_API_KEY:
+        raise AIProviderError(503, "AI is disabled because no Groq API key is configured.")
     return GroqAgent(personality=personality, role=role)
 
 
@@ -43,21 +47,59 @@ class NegotiationEngine:
         """Entry point for background simulation task."""
         async with AsyncSessionLocal() as db:
             engine = cls(negotiation_id, db)
-            await engine._run_simulation_loop()
+            try:
+                await engine._run_simulation_loop()
+            except AIProviderError as exc:
+                await db.rollback()
+                neg = await engine._load_negotiation(for_update=True)
+                if neg and neg.status == NegotiationStatus.ACTIVE:
+                    neg.status = NegotiationStatus.PAUSED
+                    neg.outcome_data = {
+                        "final_outcome": "AI provider unavailable",
+                        "breakdown_reason": exc.detail,
+                    }
+                    await engine._add_message(MessageRole.SYSTEM, exc.detail, neg.current_round or None)
+                    await db.commit()
+                logger.warning(
+                    "Simulation %s stopped because the AI provider returned HTTP %s.",
+                    negotiation_id,
+                    exc.status_code,
+                )
+            except Exception as exc:
+                await db.rollback()
+                neg = await engine._load_negotiation(for_update=True)
+                if neg and neg.status == NegotiationStatus.ACTIVE:
+                    neg.status = NegotiationStatus.PAUSED
+                    neg.outcome_data = {
+                        "final_outcome": "Simulation paused after an internal error",
+                    }
+                    await engine._add_message(
+                        MessageRole.SYSTEM,
+                        "Simulation paused unexpectedly. You can resume it from the arena.",
+                        neg.current_round or None,
+                    )
+                    await db.commit()
+                logger.error(
+                    "Simulation %s stopped after an internal error (%s).",
+                    negotiation_id,
+                    type(exc).__name__,
+                )
 
-    async def _load_negotiation(self) -> Negotiation:
-        from sqlalchemy import select
+    async def _load_negotiation(self, for_update: bool = False) -> Negotiation:
+        statement = select(Negotiation).where(Negotiation.id == self.negotiation_id)
+        if for_update:
+            statement = statement.with_for_update()
         result = await self.db.execute(
-            select(Negotiation)
-            .where(Negotiation.id == self.negotiation_id)
-            .execution_options(populate_existing=True)
+            statement.execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
 
     async def _run_simulation_loop(self):
-        neg = await self._load_negotiation()
+        neg = await self._load_negotiation(for_update=True)
         if not neg:
             logger.error(f"Negotiation {self.negotiation_id} not found")
+            return
+        if neg.status != NegotiationStatus.ACTIVE:
             return
 
         config = neg.config
@@ -66,25 +108,70 @@ class NegotiationEngine:
         agent_a = _get_agent(config.get("agent_a_personality", "collaborative"), "agent_a")
         agent_b = _get_agent(config.get("agent_b_personality", "aggressive"), "agent_b")
 
-        # System message
-        await self._add_message(
-            MessageRole.SYSTEM,
-            f"Negotiation started: {neg.title}. "
-            f"Max rounds: {neg.max_rounds}. Mode: AI vs AI (Simulation).",
-        )
+        existing_offers = list((await self.db.scalars(
+            select(Offer)
+            .where(Offer.negotiation_id == self.negotiation_id)
+            .order_by(Offer.round_number, Offer.id)
+        )).all())
+        offer_history = [
+            {"round": offer.round_number, "by": offer.made_by, "offer": offer.offer_data}
+            for offer in existing_offers
+            if isinstance(offer.offer_data, dict)
+        ]
+
+        if neg.current_round > 0:
+            last_round_offers = [
+                offer for offer in existing_offers if offer.round_number == neg.current_round
+            ]
+            last_round_messages = list((await self.db.scalars(
+                select(NegotiationMessage)
+                .where(
+                    NegotiationMessage.negotiation_id == self.negotiation_id,
+                    NegotiationMessage.round_number == neg.current_round,
+                )
+            )).all())
+            complete_round = (
+                any(offer.made_by == "agent_a" for offer in last_round_offers)
+                and any(offer.made_by == "agent_b" for offer in last_round_offers)
+                and sum(message.role == MessageRole.AGENT_A for message in last_round_messages) >= 2
+                and any(message.role == MessageRole.AGENT_B for message in last_round_messages)
+            )
+            if not complete_round:
+                for offer in last_round_offers:
+                    await self.db.delete(offer)
+                for message in last_round_messages:
+                    await self.db.delete(message)
+                neg.current_round -= 1
+                await self.db.commit()
+                existing_offers = [
+                    offer for offer in existing_offers
+                    if offer.round_number != neg.current_round + 1
+                ]
+                offer_history = [
+                    {"round": offer.round_number, "by": offer.made_by, "offer": offer.offer_data}
+                    for offer in existing_offers
+                    if isinstance(offer.offer_data, dict)
+                ]
+
+        if offer_history:
+            await self._add_message(
+                MessageRole.SYSTEM,
+                f"Simulation resumed at round {neg.current_round + 1}.",
+            )
+        else:
+            await self._add_message(
+                MessageRole.SYSTEM,
+                f"Negotiation started: {neg.title}. "
+                f"Max rounds: {neg.max_rounds}. Mode: AI vs AI (Simulation).",
+            )
         await self.db.commit()
 
-        offer_history = []
-
-        for round_num in range(1, neg.max_rounds + 1):
+        for round_num in range(neg.current_round + 1, neg.max_rounds + 1):
             # Refresh status
             neg = await self._load_negotiation()
-            if neg.status in (NegotiationStatus.PAUSED, NegotiationStatus.CANCELLED):
+            if neg.status != NegotiationStatus.ACTIVE:
                 logger.info(f"Negotiation {self.negotiation_id} paused/cancelled at round {round_num}")
                 break
-
-            neg.current_round = round_num
-            await self.db.flush()
 
             # Agent A proposes
             a_offer, a_message = await agent_a.generate_offer(
@@ -93,8 +180,12 @@ class NegotiationEngine:
                 offer_history=offer_history,
                 opponent_name=config.get("agent_b_name", "Party B"),
             )
+            neg = await self._load_negotiation()
+            if neg.status != NegotiationStatus.ACTIVE:
+                break
 
             # Validate against rules
+            neg.current_round = round_num
             a_offer = rules.clamp_offer("agent_a", a_offer)
 
             await self._add_message(MessageRole.AGENT_A, a_message, round_num)
@@ -103,6 +194,9 @@ class NegotiationEngine:
             await self.db.commit()
 
             await asyncio.sleep(0.5)  # Simulate thinking time
+            neg = await self._load_negotiation(for_update=True)
+            if neg.status != NegotiationStatus.ACTIVE:
+                break
 
             # Agent B evaluates
             b_decision, b_counter, b_message = await agent_b.evaluate_offer(
@@ -112,6 +206,9 @@ class NegotiationEngine:
                 offer_history=offer_history,
                 opponent_name=config.get("agent_a_name", "Party A"),
             )
+            neg = await self._load_negotiation(for_update=True)
+            if neg.status != NegotiationStatus.ACTIVE:
+                break
 
             if b_decision == "accept" and not rules.is_offer_acceptable("agent_b", a_offer):
                 b_decision = "counter"
@@ -135,6 +232,9 @@ class NegotiationEngine:
             await self.db.commit()
 
             await asyncio.sleep(0.5)
+            neg = await self._load_negotiation(for_update=True)
+            if neg.status != NegotiationStatus.ACTIVE:
+                break
 
             # Agent A evaluates B's counter
             a_decision, _, a_response = await agent_a.evaluate_offer(
@@ -144,6 +244,9 @@ class NegotiationEngine:
                 offer_history=offer_history,
                 opponent_name=config.get("agent_b_name", "Party B"),
             )
+            neg = await self._load_negotiation()
+            if neg.status != NegotiationStatus.ACTIVE:
+                break
             if a_decision == "accept" and not rules.is_offer_acceptable("agent_a", b_counter):
                 a_decision = "counter"
                 mock_prefix = "[MOCK] " if isinstance(agent_a, MockAgent) else ""
@@ -152,7 +255,9 @@ class NegotiationEngine:
             if a_decision == "accept":
                 await self._add_message(MessageRole.AGENT_A, a_response, round_num)
                 offer_record_b.status = OfferStatus.ACCEPTED
-                await self._complete_negotiation(neg, rules, b_counter, offer_history)
+                await self._complete_negotiation(
+                    neg, rules, b_counter, offer_history, offer_made_by="agent_b"
+                )
                 return
 
             offer_record_b.status = OfferStatus.COUNTERED
@@ -164,8 +269,10 @@ class NegotiationEngine:
                 await self._deadlock_negotiation(neg)
                 return
 
-        # Max rounds reached
-        await self._deadlock_negotiation(neg)
+        # Only an active negotiation can become deadlocked after exhausting rounds.
+        neg = await self._load_negotiation()
+        if neg and neg.status == NegotiationStatus.ACTIVE:
+            await self._deadlock_negotiation(neg)
 
     async def process_human_offer(self, offer_data: dict, message: Optional[str]) -> dict:
         """Handle a human offer in Practice Mode, get AI response."""
@@ -275,8 +382,31 @@ class NegotiationEngine:
             return a_stagnant and b_stagnant
         return False
 
-    async def _complete_negotiation(self, neg: Negotiation, rules, agreed_offer: dict, history: list):
-        satisfaction = rules.compute_satisfaction(agreed_offer)
+    async def _complete_negotiation(
+        self,
+        neg: Negotiation,
+        rules,
+        agreed_offer: dict,
+        history: list,
+        offer_made_by: str = "agent_a",
+    ):
+        result = await self.db.execute(
+            select(Negotiation)
+            .where(Negotiation.id == self.negotiation_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        neg = result.scalar_one_or_none()
+        if not neg or neg.status != NegotiationStatus.ACTIVE:
+            return
+        satisfaction_offer = agreed_offer
+        if neg.scenario_type == "project_budget" and offer_made_by == "agent_b":
+            satisfaction_offer = {
+                "my_allocation": agreed_offer.get(
+                    "opponent_allocation", rules.total_budget / 2
+                )
+            }
+        satisfaction = rules.compute_satisfaction(satisfaction_offer)
         neg.status = NegotiationStatus.COMPLETED
         neg.completed_at = datetime.now(timezone.utc)
         neg.outcome_data = {
@@ -284,6 +414,7 @@ class NegotiationEngine:
             "agreed_terms": agreed_offer,
             "initial_offer": history[0]["offer"] if history else {},
             "final_offer": agreed_offer,
+            "offer_made_by": offer_made_by,
             "satisfaction_scores": satisfaction,
         }
         await self.db.flush()
@@ -292,6 +423,15 @@ class NegotiationEngine:
         logger.info(f"Negotiation {self.negotiation_id} completed with agreement.")
 
     async def _deadlock_negotiation(self, neg: Negotiation):
+        result = await self.db.execute(
+            select(Negotiation)
+            .where(Negotiation.id == self.negotiation_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        neg = result.scalar_one_or_none()
+        if not neg or neg.status != NegotiationStatus.ACTIVE:
+            return
         neg.status = NegotiationStatus.DEADLOCKED
         neg.completed_at = datetime.now(timezone.utc)
         neg.outcome_data = {

@@ -43,6 +43,8 @@ engine_kwargs = {
 if database_url.startswith("sqlite"):
     engine_kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
     engine_kwargs["poolclass"] = StaticPool
+else:
+    engine_kwargs.update({"pool_size": 5, "max_overflow": 0, "pool_timeout": 10})
 
 engine = create_async_engine(
     database_url,

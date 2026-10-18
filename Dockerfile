@@ -15,5 +15,6 @@ COPY backend/ ./
 COPY --from=frontend-build /frontend/dist ./static
 
 ENV ENVIRONMENT=production
+USER 10001:10001
 EXPOSE 8080
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}"]

@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   User,
   Shield,
@@ -20,7 +21,8 @@ import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/Card';
 import { cn } from '@/lib/utils';
 
 export const SettingsPage: React.FC = () => {
-  const { user, updateUser } = useAuthStore();
+  const { user, updateUser, logout } = useAuthStore();
+  const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState<'profile' | 'security' | 'about'>('profile');
 
   // Profile Form State
@@ -62,8 +64,8 @@ export const SettingsPage: React.FC = () => {
       toast.error('Please fill all password fields');
       return;
     }
-    if (newPassword.length < 6) {
-      toast.error('New password must be at least 6 characters');
+    if (newPassword.length < 8) {
+      toast.error('New password must be at least 8 characters');
       return;
     }
     if (newPassword !== confirmPassword) {
@@ -74,10 +76,12 @@ export const SettingsPage: React.FC = () => {
     try {
       setPasswordSaving(true);
       await usersApi.changePassword(currentPassword, newPassword);
-      toast.success('Password changed successfully');
+      await logout();
+      toast.success('Password changed successfully. Please sign in again.');
       setCurrentPassword('');
       setNewPassword('');
       setConfirmPassword('');
+      navigate('/login', { replace: true });
     } catch (err) {
       toast.error(getErrorMessage(err));
     } finally {
@@ -214,7 +218,7 @@ export const SettingsPage: React.FC = () => {
                 placeholder="••••••••"
                 value={newPassword}
                 onChange={(e) => setNewPassword(e.target.value)}
-                helperText="Minimum 6 characters"
+                helperText="Minimum 8 characters"
                 required
               />
 

@@ -1,4 +1,4 @@
-import axios, { AxiosError } from 'axios';
+import axios, { AxiosError, type InternalAxiosRequestConfig } from 'axios';
 import type {
   TokenResponse, User, NegotiationSummary, NegotiationDetail,
   OutcomeReport, AssistantChatResponse,
@@ -6,11 +6,26 @@ import type {
 } from '@/types';
 
 const BASE_URL = '/api/v1';
+let refreshInFlight: Promise<TokenResponse> | null = null;
 
 export const apiClient = axios.create({
   baseURL: BASE_URL,
   headers: { 'Content-Type': 'application/json' },
 });
+
+function refreshTokens(refreshToken: string): Promise<TokenResponse> {
+  if (!refreshInFlight) {
+    refreshInFlight = axios
+      .post<TokenResponse>(`${BASE_URL}/auth/refresh`, { refresh_token: refreshToken })
+      .then(({ data }) => {
+        return data;
+      })
+      .finally(() => {
+        refreshInFlight = null;
+      });
+  }
+  return refreshInFlight;
+}
 
 // Attach token to every request
 apiClient.interceptors.request.use((config) => {
@@ -23,20 +38,29 @@ apiClient.interceptors.request.use((config) => {
 apiClient.interceptors.response.use(
   (res) => res,
   async (error: AxiosError) => {
-    const original = error.config as any;
-    if (error.response?.status === 401 && !original._retry) {
+    const original = error.config as (InternalAxiosRequestConfig & { _retry?: boolean }) | undefined;
+    if (
+      error.response?.status === 401 &&
+      original &&
+      !original._retry &&
+      !original.url?.startsWith('/auth/')
+    ) {
       original._retry = true;
       const refreshToken = localStorage.getItem('refresh_token');
       if (refreshToken) {
         try {
-          const { data } = await axios.post<TokenResponse>(`${BASE_URL}/auth/refresh`, {
-            refresh_token: refreshToken,
-          });
+          const data = await refreshTokens(refreshToken);
           localStorage.setItem('access_token', data.access_token);
           localStorage.setItem('refresh_token', data.refresh_token);
           original.headers.Authorization = `Bearer ${data.access_token}`;
           return apiClient(original);
         } catch {
+          const latestAccessToken = localStorage.getItem('access_token');
+          const latestRefreshToken = localStorage.getItem('refresh_token');
+          if (latestAccessToken && latestRefreshToken && latestRefreshToken !== refreshToken) {
+            original.headers.Authorization = `Bearer ${latestAccessToken}`;
+            return apiClient(original);
+          }
           localStorage.removeItem('access_token');
           localStorage.removeItem('refresh_token');
           window.location.href = '/login';
@@ -63,6 +87,8 @@ export const authApi = {
     apiClient.post<TokenResponse>('/auth/login', { email, password }),
   refresh: (refresh_token: string) =>
     apiClient.post<TokenResponse>('/auth/refresh', { refresh_token }),
+  logout: (refresh_token: string) =>
+    axios.post<void>(`${BASE_URL}/auth/logout`, { refresh_token }),
 };
 
 // ── Users ─────────────────────────────────────────────────────────────────────
